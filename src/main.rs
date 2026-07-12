@@ -1,4 +1,5 @@
 use clap::Parser;
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,10 @@ struct Args {
     #[arg(short, long, default_value_t = 1024)]
     end: u16,
 
+    /// Specific ports to scan, comma-separated (e.g. 22,80,443) — overrides --start/--end
+    #[arg(short, long, value_delimiter = ',')]
+    ports: Option<Vec<u16>>,
+
     /// Number of concurrent tasks
     #[arg(short, long, default_value_t = 100)]
     concurrency: usize,
@@ -32,37 +37,38 @@ struct Args {
     json: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct ScanResult {
     port: u16,
     banner: Option<String>,
 }
 
+async fn resolve_host(target: &str) -> Option<String> {
+    let addr = format!("{}:0", target);
+    match tokio::net::lookup_host(&addr).await {
+        Ok(mut addrs) => addrs.next().map(|a| a.ip().to_string()),
+        Err(_) => None,
+    }
+}
+
 async fn grab_banner(stream: &mut TcpStream, port: u16, timeout_ms: u64) -> Option<String> {
-    // Send an HTTP probe on common web ports, raw newline otherwise
     let probe = match port {
         80 | 443 | 8080 | 8443 => b"GET / HTTP/1.0\r\n\r\n".as_ref(),
         _ => b"\r\n",
     };
 
     let duration = Duration::from_millis(timeout_ms);
-
     let _ = timeout(duration, stream.write_all(probe)).await;
 
     let mut buf = vec![0u8; 1024];
     match timeout(duration, stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => {
-            let raw = &buf[..n];
-            let banner = String::from_utf8_lossy(raw)
+            let banner = String::from_utf8_lossy(&buf[..n])
                 .trim()
                 .chars()
                 .filter(|c| !c.is_control() || *c == '\n')
                 .collect::<String>();
-            if banner.is_empty() {
-                None
-            } else {
-                Some(banner)
-            }
+            if banner.is_empty() { None } else { Some(banner) }
         }
         _ => None,
     }
@@ -89,13 +95,31 @@ async fn scan_port(target: &str, port: u16, timeout_ms: u64) -> Option<ScanResul
 async fn main() {
     let args = Args::parse();
 
-    println!("Scanning {} ports {}-{}", args.target, args.start, args.end);
+    let ip = match resolve_host(&args.target).await {
+        Some(ip) => {
+            if ip != args.target {
+                println!("Resolved {} -> {}", args.target, ip);
+            }
+            ip
+        }
+        None => {
+            eprintln!("Error: could not resolve host '{}'", args.target);
+            std::process::exit(1);
+        }
+    };
+
+    let ports: Vec<u16> = match &args.ports {
+        Some(p) => p.clone(),
+        None => (args.start..=args.end).collect(),
+    };
+
+    println!("Scanning {} ({} ports)", args.target, ports.len());
 
     let mut handles = vec![];
     let mut open_ports: Vec<ScanResult> = vec![];
 
-    for port in args.start..=args.end {
-        let target = args.target.clone();
+    for port in ports {
+        let target = ip.clone();
         let timeout_ms = args.timeout;
 
         let handle = tokio::spawn(async move {
@@ -122,10 +146,7 @@ async fn main() {
     if open_ports.is_empty() {
         println!("No open ports found.");
     } else if args.json {
-        for r in &open_ports {
-            let banner = r.banner.as_deref().unwrap_or("");
-            println!(r#"{{"port":{},"banner":"{}"}}"#, r.port, banner);
-        }
+        println!("{}", serde_json::to_string_pretty(&open_ports).unwrap());
     } else {
         for r in &open_ports {
             match &r.banner {
