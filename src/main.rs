@@ -46,7 +46,14 @@ struct ScanResult {
 async fn resolve_host(target: &str) -> Option<String> {
     let addr = format!("{}:0", target);
     match tokio::net::lookup_host(&addr).await {
-        Ok(mut addrs) => addrs.next().map(|a| a.ip().to_string()),
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            // prefer IPv4 — IPv6 and IPv4 listeners are separate sockets
+            addrs.iter()
+                .find(|a| a.is_ipv4())
+                .or_else(|| addrs.first())
+                .map(|a| a.ip().to_string())
+        }
         Err(_) => None,
     }
 }
